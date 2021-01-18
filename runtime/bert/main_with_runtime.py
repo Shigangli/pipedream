@@ -34,14 +34,172 @@ from optimizer_with_stashing import OptimizerWithStashing
 from optimizer_with_stashing_and_aggregation import OptimizerWithStashingAndAggregation
 from ptflops import get_model_complexity_info
 
+import os.path as osp
+import shlex
+import signal
+import subprocess
+import threading
+from typing import Any, Optional, Tuple
+
+import ifcfg
+import torch.distributed as distrib
+
+EXIT = threading.Event()
+EXIT.clear()
+REQUEUE = threading.Event()
+REQUEUE.clear()
+# Default port to initialized the TCP store on
+DEFAULT_PORT = 8738
+# Default address of world rank 0
+DEFAULT_MASTER_ADDR = "127.0.0.1"
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+SLURM_JOBID = os.environ.get("SLURM_JOB_ID", None)
+INTERRUPTED_STATE_FILE = osp.join(
+    os.environ["HOME"], ".interrupted_states", f"{SLURM_JOBID}.pth"
+)
+os.environ['MASTER_PORT'] = "1234"
 
 # Helper methods.
+
+def _clean_exit_handler(signum, frame):
+    EXIT.set()
+    print("Exiting cleanly", flush=True)
+
+
+def _requeue_handler(signal, frame):
+    EXIT.set()
+    REQUEUE.set()
+
+
+def add_signal_handlers():
+    signal.signal(signal.SIGINT, _clean_exit_handler)
+    signal.signal(signal.SIGTERM, _clean_exit_handler)
+
+    # SIGUSR2 can be sent to all processes to have them cleanup
+    # and exit nicely.  This is nice to use with SLURM as scancel <job_id>
+    # sets a 30 second timer for the job to exit, and it can take more than
+    # 30 seconds for the job to cleanup and exit nicely.  When using NCCL,
+    # forcing the job to exit without cleaning up can be bad.
+    # scancel --signal SIGUSR2 <job_id> will set no such timer and will give
+    # the job ample time to cleanup and exit.
+    signal.signal(signal.SIGUSR2, _clean_exit_handler)
+
+    signal.signal(signal.SIGUSR1, _requeue_handler)
+
+
+def save_interrupted_state(state: Any, filename: str = None):
+    r"""Saves the interrupted job state to the specified filename.
+        This is useful when working with preemptable job partitions.
+
+    This method will do nothing if SLURM is not currently being used and the filename is the default
+
+    :param state: The state to save
+    :param filename: The filename.  Defaults to "${HOME}/.interrupted_states/${SLURM_JOBID}.pth"
+    """
+    if SLURM_JOBID is None and filename is None:
+        logger.warn("SLURM_JOBID is none, not saving interrupted state")
+        return
+
+    if filename is None:
+        filename = INTERRUPTED_STATE_FILE
+
+    torch.save(state, filename)
+
+
+def load_interrupted_state(filename: str = None) -> Optional[Any]:
+    r"""Loads the saved interrupted state
+
+    :param filename: The filename of the saved state.
+        Defaults to "${HOME}/.interrupted_states/${SLURM_JOBID}.pth"
+
+    :return: The saved state if the file exists, else none
+    """
+    if SLURM_JOBID is None and filename is None:
+        return None
+
+    if filename is None:
+        filename = INTERRUPTED_STATE_FILE
+
+    if not osp.exists(filename):
+        return None
+
+    return torch.load(filename, map_location="cpu")
+
+
+def requeue_job():
+    r"""Requeues the job by calling `scontrol requeue ${SLURM_JOBID}`
+    """
+    if SLURM_JOBID is None:
+        return
+
+    if not REQUEUE.is_set():
+        return
+
+    distrib.barrier()
+
+    if distrib.get_rank() == 0:
+        logger.info(f"Requeueing job {SLURM_JOBID}")
+        subprocess.check_call(shlex.split("scontrol requeue {SLURM_JOBID}"))
+
+
+def get_ifname():
+    return ifcfg.default_interface()["device"]
+
+def init_distrib_slurm(backend: str = "nccl"):
+    r"""Initializes torch.distributed by parsing environment variables set
+        by SLURM when `srun` is used or by parsing environment variables set
+        by torch.distributed.launch
+
+    :param backend: Which torch.distributed backend to use
+
+    :returns: Tuple of the local_rank (aka which GPU to use for this process)
+        and the TCPStore used for the rendezvous
+    """
+    assert (
+        torch.distributed.is_available()
+    ), "torch.distributed must be available"
+
+    #if "GLOO_SOCKET_IFNAME" not in os.environ:
+    #    os.environ["GLOO_SOCKET_IFNAME"] = get_ifname()
+
+    if "NCCL_SOCKET_IFNAME" not in os.environ:
+        os.environ["NCCL_SOCKET_IFNAME"] = get_ifname()
+
+    master_port = int(os.environ.get("MASTER_PORT", DEFAULT_PORT))
+    master_addr = os.environ.get("MASTER_ADDR", DEFAULT_MASTER_ADDR)
+
+    # Check to see if we should parse from torch.distributed.launch
+    if os.environ.get("LOCAL_RANK", None) is not None:
+        print("local_rank")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_size = int(os.environ["LOCAL_SIZE"])
+    # Else parse from SLURM is using SLURM
+    elif os.environ.get("SLURM_JOBID", None) is not None:
+        print("slurm_jobid")
+        local_rank = int(os.environ["SLURM_LOCALID"])
+        world_rank = int(os.environ["SLURM_PROCID"])
+        world_size = int(os.environ["SLURM_NTASKS"])
+        local_size = int(os.environ["SLURM_NTASKS_PER_NODE"])
+    # Otherwise setup for just 1 process, this is nice for testing
+    else:
+        local_rank = 0
+        world_rank = 0
+        world_size = 1
+        local_size = 1
+
+    #distrib.init_process_group(
+    #    backend, rank=world_rank, world_size=world_size
+    #)
+    return local_rank, local_size, world_rank, world_size, master_addr
+
+
 
 def save_checkpoint(state, checkpoint_dir, stage, epoch):
     assert os.path.isdir(checkpoint_dir)
@@ -87,11 +245,13 @@ class BertAdamWithStashing(OptimizerWithStashing):
 
 
 class BERTDataset(Dataset):
-    def __init__(self, corpus_path, tokenizer, seq_len, encoding="utf-8", corpus_lines=None, on_memory=True):
+    #def __init__(self, corpus_path, tokenizer, seq_len, encoding="utf-8", corpus_lines=None, on_memory=True):
+    def __init__(self, corpus_path, tokenizer, seq_len, encoding="utf-8", corpus_lines=None, on_memory=False):
         self.vocab = tokenizer.vocab
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.on_memory = on_memory
+        #self.on_memory = False
         self.corpus_lines = corpus_lines  # number of non-empty lines in input corpus
         self.corpus_path = corpus_path
         self.encoding = encoding
@@ -107,7 +267,7 @@ class BERTDataset(Dataset):
         self.sample_to_doc = [] # map sample index to doc and line
 
         # load samples into memory
-        if on_memory:
+        if self.on_memory:
             self.all_docs = []
             doc = []
             self.corpus_lines = 0
@@ -571,26 +731,32 @@ def main():
     parser.add_argument('--data_dir', type=str, default='')
     parser.add_argument('--model_dir', type=str, default='')
     parser.add_argument('--load', type=str, default=None)
+    parser.add_argument("--backend",
+                        default="nccl",
+                        type=str,
+                        required=True,
+                        help="Communication backend.")
 
     global args
     args = parser.parse_args()
 
     assert (args.pipedream and args.gpipe) is False
 
-    if args.local_rank == -1 or args.no_cuda:
-        torch.cuda.set_device(0)
-        device = torch.device("cuda")
-        n_gpu = 1
-    else:
-        n_gpu = torch.cuda.device_count()
-        logger.info('local_rank: {}, device_count: {}'.format(
-            args.local_rank,
-            torch.cuda.device_count()))
+    local_rank, local_size, world_rank, world_size, master_addr = init_distrib_slurm(
+            'nccl'
+        )
 
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-    logger.info("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
-        device, n_gpu, bool(args.local_rank != -1), args.fp16))
+    n_gpu = torch.cuda.device_count()
+    assert local_size <= n_gpu
+    args.local_rank = local_rank
+    args.rank = world_rank
+    args.master_addr = master_addr
+
+    torch.cuda.set_device(args.local_rank)
+    device = torch.device("cuda", args.local_rank)
+
+    logger.info("device: {} local_size: {}, distributed training: {}, 16-bits training: {}".format(
+        device, local_size, bool(world_size != 1), args.fp16))
 
     if args.gradient_accumulation_steps < 1:
         raise ValueError("Invalid gradient_accumulation_steps parameter: {}, should be >= 1".format(
@@ -601,7 +767,7 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if n_gpu > 0:
+    if local_size > 0:
         torch.cuda.manual_seed_all(args.seed)
 
     if not args.do_train:
@@ -618,6 +784,8 @@ def main():
         args.module = args.module.replace(m.group(1), "")
     else:
         raise Exception("Invalid --module argument!")
+
+    print("module: ", args.module, "num_hidden_layers: ", config.num_hidden_layers)
     import importlib
     module = importlib.import_module(args.module)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
@@ -708,6 +876,7 @@ def main():
         num_ranks_in_server=args.num_ranks_in_server,
         verbose_freq=args.verbose_frequency,
         model_type=runtime.BERT,
+        backend=args.backend,
         use_apex=args.use_apex)
     update_interval = r.num_stages
     if args.pipedream:
@@ -802,7 +971,8 @@ def main():
 
     global_step = 0
     if args.do_train:
-        if args.local_rank == -1:
+        #if args.local_rank == -1:
+        if local_size == 1:
             train_sampler = RandomSampler(train_dataset)
         else:
             train_sampler = None
@@ -821,11 +991,13 @@ def main():
         train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
         losses = AverageMeter()
 
-        if args.local_rank != -1:
+        #if args.local_rank != -1:
+        if world_size != 1:
             import torch.distributed as dist; dist.barrier()
 
         if args.num_minibatches is not None:
             args.num_train_epochs = 1
+        args.num_train_epochs = 1
         for epoch in range(int(args.num_train_epochs)):
             epoch_start_time = time.time()
 
@@ -834,7 +1006,7 @@ def main():
                 n = args.num_minibatches
             # Number of iterations should be multiple of update_interval.
             n = ((n // update_interval)) * update_interval
-
+            n = 1
             if r.is_first_stage():
                 input_source = InputSource(train_loader, r.parameters())
                 r.set_input_source(input_source)
@@ -853,7 +1025,8 @@ def main():
                 epoch_start_time, time.time()))
 
             # Barrier after completing iterations to wait for other ranks to finish.
-            if args.local_rank != -1:
+            #if args.local_rank != -1:
+            if world_size != 1:
                 import torch.distributed as dist; dist.barrier()
 
             should_save_checkpoint = r.rank_in_stage == 0
@@ -864,6 +1037,8 @@ def main():
                     'state_dict': r.state_dict(),
                     'optimizer' : optimizer.state_dict(),
                 }, args.checkpoint_dir, r.stage, epoch)
+    print("after train")
+    return
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -906,9 +1081,13 @@ class AverageMeter(object):
 
 
 if __name__ == "__main__":
+    #main()
     try:
         main()
     except Exception as e:
-        print("Exception")
+        print("Exception in main")
+        print(e.args)
+        print(str(e))
+        print(repr(e))
         print(e)
         exit(-1)

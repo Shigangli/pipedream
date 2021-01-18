@@ -57,8 +57,7 @@ class StageRuntime:
                  training_tensor_dtypes, inputs_module_destinations,
                  target_tensor_names, configuration_maps, master_addr,
                  rank, local_rank, num_ranks_in_server, verbose_freq,
-                 model_type,
-                 use_apex=False):
+                 model_type, backend, use_apex=False):
         # Metadata needed for forward and backward pass within this stage.
         self.tensors = []
         self.gradients = {}
@@ -70,6 +69,9 @@ class StageRuntime:
         self.model_type = model_type
         self.target_tensor_names = target_tensor_names
         self.use_apex = use_apex
+        self.backend = backend
+        #print("setup backend: ", backend)
+        #print("setup backend self: ", self.backend)
 
         self.initialize(model, inputs_module_destinations, configuration_maps,
                         master_addr, rank, local_rank, num_ranks_in_server)
@@ -144,12 +146,17 @@ class StageRuntime:
             for stage in self.stage_to_rank_map:
                 for rank in self.stage_to_rank_map[stage]:
                     rank_to_stage_map[rank] = stage
+            
+            print("stage_to_module_map: ", stage_to_module_map)
+            print("self.module_to_stage_map: ", self.module_to_stage_map)
+            print("rank_to_stage_map: ", rank_to_stage_map)
 
             # Now, use this mapping to determine the modules contained in
             # each stage.
             assert 0 <= self.rank < len(rank_to_stage_map)
             self.num_ranks = len(rank_to_stage_map)
             self.num_stages = len(stage_to_module_map)
+            print("self.num_stages: ", self.num_stages)
             self.stage = rank_to_stage_map[self.rank]
             self.rank_in_stage = self.stage_to_rank_map[self.stage].index(self.rank)
             self.num_ranks_in_stage = len(self.stage_to_rank_map[self.stage])
@@ -185,7 +192,8 @@ class StageRuntime:
             # determine the "producing" and "consuming" module IDs of each
             # tensor. We then use the corresponding machine ranks to send
             # and receive tensors.
-            master_port = 12345
+            #master_port = 12345
+            master_port = 1234
             self.comm_handler = communication.CommunicationHandler(
                 master_addr=master_addr,
                 master_port=master_port,
@@ -194,7 +202,7 @@ class StageRuntime:
                 num_ranks_in_server=num_ranks_in_server,
                 world_size=self.num_ranks,
                 fp16=self.fp16,
-                num_stages=self.num_stages)
+                backend=self.backend)
 
             for i in range(len(model)):
                 for j in range(i+1, len(model)):
@@ -248,6 +256,7 @@ class StageRuntime:
                         self.tensor_tags[model_inputs] = tensor_tag
                         tensor_tag += 1
 
+        print("self rank: ", self.rank, "send_ranks: ", self.send_ranks, "recv_ranks: ", self.receive_ranks)
         modules = self.modules_with_dependencies.modules()
         for i in range(len(modules)):
             modules[i] = modules[i].cuda()
